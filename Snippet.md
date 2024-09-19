@@ -247,6 +247,32 @@ mybatis:
 
 
 
+### Interceptor 配置
+
+```java
+@Configuration
+public class InterceptorConfig implements WebMvcConfigurer {
+    @Resource
+    MemberInterceptor memberInterceptor;
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        // 路径不要包含context-path(即 application.yml 中配置的，最前面的：/member)
+        registry.addInterceptor(memberInterceptor)
+                .addPathPatterns("/**")
+                .excludePathPatterns(
+                        "/hello",
+                        "/member/send-code",
+                        "/member/login"
+                );
+    }
+}
+```
+
+---
+
+
+
 ## 切面编程
 
 ### LogAspect
@@ -340,6 +366,97 @@ public class LogAspect {
     <artifactId>spring-boot-starter-aop</artifactId>
     <version>3.0.0</version>
 </dependency>
+```
+
+---
+
+
+
+### PageAspect
+
+所有涉及分页的 Service 方法，返回值都必须是 PageVo：
+
+```java
+@EqualsAndHashCode(callSuper = true)
+@Data
+public class PageVo<T> extends PageInfo<T> {
+    /**
+     * 后端额外携带的分页信息
+     */
+    private String msg;
+}
+```
+
+所有涉及分页的 Service 方法，参数必须继承 PageForm：
+
+```java
+/**
+ * 作为所有需要分页的 form 请求的父类，统一提供 pageNum 和 pageSize
+ */
+@Data
+public class PageForm {
+    /**
+     * 查询页码
+     */
+    @NotNull(message = "【查询页码】不能为空")
+    private Integer pageNum; // 不能使用 int，int 有默认值 0，而 Integer 的默认值是 null，int 会“蒙混过关”
+
+    /**
+     * 每页条数
+     */
+    @NotNull(message = "【每页条数】不能为空")
+    @Max(value = 50, message = "【每页条数】不能超过上限50")
+    private Integer pageSize;
+}
+```
+
+这样就可以定义切面，并且对参数和返回值进行安全的向下转型，得到 PageAspect：
+
+```java
+/**
+ * 拦截 service 层所有涉及到分类的方法
+ */
+@Slf4j
+@Aspect
+@Component
+public class PageAspect {
+
+    /**
+     * 在包 garry 及其子包中，
+     * 类名包含 Service 的所有类中的所有公共方法，
+     * 这些方法的返回值必须是 garry.train.common.vo.PageVo 类型，
+     * 无论它们的方法名和参数是什么。
+     */
+    @Pointcut("execution(public garry.train.common.vo.PageVo garry..*Service*.*(..))")
+    public void pageServicePointcut() {
+    }
+
+    @Around("pageServicePointcut()")
+    public Object doAround(ProceedingJoinPoint proceedingJoinPoint) throws Throwable {
+        Object[] args = proceedingJoinPoint.getArgs();
+        PageForm form = null;
+        for (Object arg : args) {
+            if (arg instanceof PageForm) {
+                form = (PageForm) arg;
+                break;
+            }
+        }
+        if (ObjectUtil.isNotNull(form)) {
+            log.info("查询页码: {}", form.getPageNum());
+            log.info("每页条数: {}", form.getPageNum());
+        }
+
+        Object result = proceedingJoinPoint.proceed();
+
+        if (result instanceof PageVo) {
+            PageVo vo = (PageVo) result;
+            log.info("总行数: {}", vo.getSize());
+            log.info("总页数: {}", vo.getPages());
+        }
+
+        return result;
+    }
+}
 ```
 
 ---
@@ -451,6 +568,135 @@ public class JWTUtil {
 
 
 
+### HostHolder
+
+```java
+@Slf4j
+@Component
+public class HostHolder {
+    private final ThreadLocal<MemberLoginVo> members = new ThreadLocal<>();
+
+    public void setMember(MemberLoginVo vo) {
+        members.set(vo);
+    }
+
+    public MemberLoginVo getMember() {
+        return members.get();
+    }
+
+    public void remove() {
+        members.remove();
+    }
+
+    public Long getMemberId() {
+        try {
+            return members.get().getId();
+        } catch (Exception e) {
+            log.error(ResponseEnum.THREAD_LOCAL_ERROR.getMsg());
+            throw new BusinessException(ResponseEnum.THREAD_LOCAL_ERROR);
+        }
+    }
+}
+```
+
+---
+
+
+
+### PageHelper
+
+1. 依赖(必须要 1.4.6+ 的版本才支持 Springboot3.x)：
+
+	```xml
+	<!--pageHelper，必须要1.4.6+的版本才支持Springboot3.x-->
+	<dependency>
+	    <groupId>com.github.pagehelper</groupId>
+	    <artifactId>pagehelper-spring-boot-starter</artifactId>
+	    <version>1.4.6</version>
+	</dependency>
+	```
+
+2. 使用，原理是将遇到的一条 sql 进行 limit 改造：
+
+	```java
+	// 启动分页
+	PageHelper.startPage(form.getPageNum(), form.getPageSize());
+	
+	// 获取 passengers
+	List<Passenger> passengers = passengerMapper.selectByExample(passengerExample);
+	
+	// 获得 pageInfo 对象，并将其 List 的模板类型改为 PassengerQueryVo
+	// 注意这里必须先获取 pageInfo，再尝试获取 List<PassengerQueryVo>，否则无法正确获取 pageNum，pages 等重要属性
+	PageInfo<Passenger> pageInfo = new PageInfo<>(passengers);
+	List<PassengerQueryVo> voList = BeanUtil.copyToList(pageInfo.getList(), PassengerQueryVo.class);
+	
+	// 获取 PageVo 对象
+	PageVo<PassengerQueryVo> vo = BeanUtil.copyProperties(pageInfo, PageVo.class);
+	vo.setList(voList);
+	vo.setMsg("queryList success");
+	return vo;
+	```
+
+3. PageInfo 对象的样子，可见有很多前端可以很方便使用的属性，比如 nextPage、navigatePages：
+
+	```json
+	"PageInfo": {
+	    "total": 15,
+	    "list": [
+	        {
+	            "id": 1834949134566690816,
+	            "memberId": 1833041335083470848,
+	            "name": "13",
+	            "idCard": "123111",
+	            "type": "2",
+	            "createTime": "2024-09-14T13:35:40.044+00:00",
+	            "updateTime": "2024-09-14T13:35:40.044+00:00"
+	        },
+	        {
+	            "id": 1834958731079716864,
+	            "memberId": 1833041335083470848,
+	            "name": "14",
+	            "idCard": "000000200401270000",
+	            "type": "3",
+	            "createTime": "2024-09-14T14:13:48.031+00:00",
+	            "updateTime": "2024-09-14T14:13:48.031+00:00"
+	        },
+	        {
+	            "id": 1834958759143804928,
+	            "memberId": 1833041335083470848,
+	            "name": "15",
+	            "idCard": "000000200401270000",
+	            "type": "3",
+	            "createTime": "2024-09-14T14:13:54.722+00:00",
+	            "updateTime": "2024-09-14T14:13:54.722+00:00"
+	        }
+	    ],
+	    "pageNum": 2,
+	    "pageSize": 12,
+	    "size": 3,
+	    "startRow": 13,
+	    "endRow": 15,
+	    "pages": 2,
+	    "prePage": 1,
+	    "nextPage": 0,
+	    "isFirstPage": false,
+	    "isLastPage": true,
+	    "hasPreviousPage": true,
+	    "hasNextPage": false,
+	    "navigatePages": 8,
+	    "navigatepageNums": [
+	        1,
+	        2
+	    ],
+	    "navigateFirstPage": 1,
+	    "navigateLastPage": 2
+	}
+	```
+
+---
+
+
+
 ## 统一响应类
 
 ```java
@@ -529,7 +775,7 @@ public enum ResponseEnum {
 
 ## 拦截器
 
-### 网关统一登录拦截器
+### 网关统一登录过滤器
 
 > `String token = exchange.getRequest().getHeaders().getFirst("token");` 要求前端传来的 Request.headers 里面必须有一个自定义的 `token` 字段。
 
@@ -556,6 +802,8 @@ public class MemberLoginFilter implements GlobalFilter, Ordered {
                 exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
                 log.info("------------- 结束 {} -------------\n", path);
                 return exchange.getResponse().setComplete();
+            } else {
+                log.info("登录校验通过");
             }
         }
 
@@ -568,6 +816,75 @@ public class MemberLoginFilter implements GlobalFilter, Ordered {
     @Override
     public int getOrder() {
         return -1; // 设置过滤器的优先级，数字越小优先级越高
+    }
+}
+```
+
+---
+
+
+
+### 非网关拦截器
+
+```java
+@Slf4j
+@Component
+public class MemberInterceptor implements HandlerInterceptor {
+    @Resource
+    private HostHolder hostHolder;
+
+    /**
+     * 获取 request header 中的 token，由此获取 token 中的原始信息，保存到 hostHolder 中
+     */
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        log.info("------------- MemberInterceptor 开始 -------------");
+        String path = request.getContextPath() + request.getServletPath();
+        log.info("MemberInterceptor 拦截路径 = {}", path);
+        String token = request.getHeader("token");
+        if (StrUtil.isNotBlank(token)) {
+            log.info("获取会员登录 token = {}", token);
+            JSONObject loginMember = JWTUtil.getJSONObject(token);
+            MemberLoginVo memberLoginVo = JSONUtil.toBean(loginMember, MemberLoginVo.class);
+            memberLoginVo.setToken(token);
+            log.info("当前登录会员：{}", memberLoginVo);
+            hostHolder.setMember(memberLoginVo);
+        } else {
+            log.info("{} 的 token 不存在或已过期", path);
+        }
+
+        return true;
+    }
+
+    @Override
+    public void postHandle(HttpServletRequest request, HttpServletResponse response, Object handler, ModelAndView modelAndView) {
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) {
+        hostHolder.remove();
+    }
+}
+```
+
+相应的，拦截器的配置类：
+
+```java
+@Configuration
+public class InterceptorConfig implements WebMvcConfigurer {
+    @Resource
+    MemberInterceptor memberInterceptor;
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        // 路径不要包含context-path(即 application.yml 中配置的，最前面的：/member)
+        registry.addInterceptor(memberInterceptor)
+                .addPathPatterns("/**")
+                .excludePathPatterns(
+                        "/hello",
+                        "/member/send-code",
+                        "/member/login"
+                );
     }
 }
 ```
@@ -738,6 +1055,79 @@ generator-config.xml
 
 
 
+### freemarker 引擎
+
+1. 引入依赖：
+
+	```xml
+	<!--模板引擎 freemarker-->
+	<dependency>
+	    <groupId>org.freemarker</groupId>
+	    <artifactId>freemarker</artifactId>
+	    <version>2.3.31</version>
+	</dependency>
+	```
+
+2. 工具类：
+
+	```java
+	public class FreemarkerUtil {
+	
+	    static String ftlPath = "generator/src/main/java/garry/train/generator/ftl/";
+	
+	    static Template temp;
+	
+	    /**
+	     * 读模板
+	     */
+	    public static void initConfig(String ftlName) throws IOException {
+	        // 这里的版本与你实际使用的 freemarker 的版本一致
+	        Configuration cfg = new Configuration(Configuration.VERSION_2_3_31);
+	        cfg.setDirectoryForTemplateLoading(new File(ftlPath));
+	        cfg.setObjectWrapper(new DefaultObjectWrapper(Configuration.VERSION_2_3_31));
+	        temp = cfg.getTemplate(ftlName);
+	    }
+	
+	    /**
+	     * 根据模板，生成文件
+	     */
+	    public static void generator(String fileName, Map<String, Object> map) throws IOException, TemplateException {
+	        FileWriter fw = new FileWriter(fileName);
+	        BufferedWriter bw = new BufferedWriter(fw);
+	        temp.process(map, bw);
+	        bw.flush();
+	        fw.close();
+	    }
+	}
+	```
+
+3. ftl 模板：
+
+	```js
+	public class ${domain} {
+	    public String str;
+	}
+	```
+
+4. 使用：
+
+	```java
+	public class ServerGenerator {
+	    private static String toPath = "generator/src/main/java/garry/train/generator/test/";
+	
+	    public static void main(String[] args) throws Exception {
+	        FreemarkerUtil.initConfig("test.ftl");
+	        HashMap<String, Object> map = new HashMap<>();
+	        map.put("domain", "Test");
+	        FreemarkerUtil.generator(toPath + "Test.java", map);
+	    }
+	}
+	```
+
+----
+
+
+
 ## 注解
 
 ### @RestController
@@ -786,6 +1176,10 @@ public ResponseVo register(@Valid @RequestBody MemberRegisterForm form)
 ### @RequestBody
 
 > 必须使用@RequestBody，才能接收(application/json)格式的请求。
+>
+> 只有POST类型的请求才加@RequestBody，因为Content-type=application/json
+>
+> 而GET类型请求由于Accept=application/json，因此加了@RequestBody反而会报错！
 
 ```java
 public ResponseVo register(@Valid @RequestBody MemberRegisterForm form)
@@ -857,6 +1251,45 @@ public void controllerPointcut() {}
 
 ```java
 @MapperScan("garry.train.member.mapper") // 扫描mybatis的代码
+```
+
+### @JsonSerialize
+
+主要用于改变 Long 类型的序列化方式，避免后端 Long 类型传递到前端时，精度损失：
+
+```java
+@Data
+public class PassengerQueryVo {
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long id;
+
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long memberId;
+
+    private String name;
+
+    private String idCard;
+
+    private String type;
+
+    private Date createTime;
+
+    private Date updateTime;
+}
+```
+
+---
+
+
+
+### @PathVariable
+
+```java
+@RequestMapping(value = "/delete/{id}", method = RequestMethod.DELETE)
+public ResponseVo delete(@PathVariable Long id) {
+    passengerService.delete(id);
+    return ResponseVo.success();
+}
 ```
 
 ---
@@ -977,4 +1410,270 @@ router.beforeEach((to, from, next) => {
 ---
 
 
+
+## 脚本
+
+### watch() 用法
+
+```javascript
+/**
+ * 动态监视 router.currentRoute.value.path 的变化，变化时触发后面的函数
+ */
+watch(() => router.currentRoute.value.path, (newValue) => {
+    selectedKeys.value = [];
+    selectedKeys.value.push(newValue);
+}, {immediate: true});
+```
+
+---
+
+
+
+### axios 请求服务器
+
+```javascript
+axios.post('member/passenger/save', {
+    param1: 'xxx',
+    param2: 'xxx',
+}).then(response => {
+    let responseVo = response.data;
+    if (responseVo.success) {
+        notification.success({description: '成功'});
+    } else {
+        notification.error({description: responseVo.msg});
+    }
+})
+```
+
+---
+
+
+
+### 模态框
+
+```vue
+<template>
+  <div>
+    <a-button type="primary" @click="showModal">新增</a-button>
+    <a-modal v-model:visible="visible" title="乘车人" @ok="handleOk"
+             ok-text="确认" cancel-text="取消">
+      <a-form :label-col="{span: 4}" :wrapper-col="{span: 14}">
+        <a-form-item label="姓名">
+          <a-input v-model:value="passenger.name"/>
+        </a-form-item>
+        <a-form-item label="身份证号">
+          <a-input v-model:value="passenger.idCard"/>
+        </a-form-item>
+        <a-form-item label="乘客类型">
+          <a-select v-model:value="passenger.type">
+            <a-select-option value="1">成人</a-select-option>
+            <a-select-option value="2">儿童</a-select-option>
+            <a-select-option value="3">学生</a-select-option>
+          </a-select>
+        </a-form-item>
+      </a-form>
+    </a-modal>
+  </div>
+</template>
+```
+
+---
+
+
+
+## 组件
+
+### 导航栏
+
+```vue
+<template>
+  <a-layout-header class="header">
+    <a-menu
+        v-model:selectedKeys="selectedKeys"
+        theme="dark"
+        mode="horizontal"
+        :style="{ lineHeight: '64px' }"
+    >
+      <a-menu-item key="/welcome">
+        <router-link to="/welcome">
+          <coffee-outlined/> &nbsp; 欢迎
+        </router-link>
+      </a-menu-item>
+      <a-menu-item key="/passenger">
+        <router-link to="/passenger">
+          <user-outlined/> &nbsp; 乘车
+        </router-link>
+      </a-menu-item>
+    </a-menu>
+  </a-layout-header>
+</template>
+```
+
+---
+
+
+
+### 侧边栏
+
+```vue
+<template>
+  <a-layout-sider width="15%" style="background: #fff; height: 100vh">
+    <a-menu
+        v-model:selectedKeys="selectedKeys"
+        v-model:openKeys="openKeys"
+        mode="inline"
+        :style="{ height: '100%', borderRight: 0 }"
+    >
+      <a-menu-item key="/welcome">
+        <router-link to="/welcome">
+          <coffee-outlined/> &nbsp; 欢迎
+        </router-link>
+      </a-menu-item>
+      <a-menu-item key="/passenger">
+        <router-link to="/passenger">
+          <user-outlined/> &nbsp; 乘车
+        </router-link>
+      </a-menu-item>
+    </a-menu>
+  </a-layout-sider>
+</template>
+```
+
+---
+
+
+
+### 表格
+
+```vue
+<a-table :dataSource="passengers"
+         :columns="columns"
+         :pagination="pagination"
+         @change="handleTableChange"
+         :loading="loading">
+    <template #bodyCell="{ column, record }"> <!--自带两个参数-->
+<template v-if="column.dataIndex === 'operation'">
+    <a-space>
+        <a-popconfirm
+                      title="删除后不可恢复，确认删除?"
+                      @confirm="onDelete(record)"
+                      ok-text="确认" cancel-text="取消"
+                      >
+            <a style="color: red">删除</a>
+        </a-popconfirm>
+        <a @click="onEdit(record)">编辑</a>
+        </a-space>
+    </template>
+    <template v-else-if="column.dataIndex === 'type'">
+<span v-for="item in PASSENGER_TYPE_ARRAY" :key="item.code">
+    <span v-if="item.code === record.type">
+        {{ item.desc }}
+        </span>
+        </span>
+    </template>
+    </template>
+</a-table>
+```
+
+js：
+
+```javascript
+export default defineComponent({
+  setup() {
+    const passengers = ref([]);
+    const loading = ref(false);
+
+    const pagination = ref({ // 框架规定的属性名，不能改属性名！
+      total: 0, /*所有的总数，list.total*/
+      current: 1, /*list.pageNum*/
+      pageSize: 10,
+    });
+
+    const columns = ref([
+      {
+        title: '姓名',
+        dataIndex: 'name',
+        key: 'name',
+      },
+      {
+        title: '身份证号',
+        dataIndex: 'idCard',
+        key: 'idCard',
+      },
+      {
+        title: '乘客类型',
+        dataIndex: 'type',
+        key: 'type',
+      },
+      {
+        title: '操作',
+        dataIndex: 'operation',
+      }
+    ]);
+
+    /**
+     * 处理查询请求
+     * @param param {pageNum, pageSize}
+     */
+    const handleQuery = (param) => {
+      let byRefresh = false;
+      if (!param) {
+        param = {
+          pageNum: 1,
+          pageSize: pagination.value.pageSize,
+        };
+        byRefresh = true;
+      }
+      loading.value = true;
+      axios.get('member/passenger/query-list', {
+        params: {
+          pageNum: param.pageNum,
+          pageSize: param.pageSize,
+        }
+      }).then(response => {
+        loading.value = false;
+        let responseVo = response.data;
+        if (responseVo.success) {
+          passengers.value = responseVo.data.list;
+          pagination.value.total = responseVo.data.total;
+          // 设置当前的页码，如果不设置的话，就只会设置第二页的内容，但是页码依然是第一页
+          pagination.value.current = responseVo.data.pageNum;
+          if (byRefresh)
+            notification.success({description: '刷新成功'});
+        } else {
+          notification.error({description: responseVo.msg});
+        }
+      })
+    };
+
+    /**
+     * 表格发生改变的回调函数，点击页码也算改变
+     * @param pagination
+     */
+    const handleTableChange = (pagination) => {
+      // handleTableChange 自带一个 pagination 参数，含有 total，current，pageSize 三个属性
+      handleQuery({
+        pageNum: pagination.current,
+        pageSize: pagination.pageSize,
+      });
+    };
+
+    /**
+     * 页面初始化的触发函数
+     */
+    onMounted(() => {
+      handleQuery({
+        pageNum: 1,
+        pageSize: pagination.value.pageSize,
+      })
+    });
+
+    return {
+      ...
+    };
+  },
+});
+```
+
+---
 

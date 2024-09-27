@@ -893,6 +893,418 @@ public class InterceptorConfig implements WebMvcConfigurer {
 
 
 
+## 定时调度
+
+### SpringBoot Scheduler
+
+1. SpringBootTestJob：
+
+	```java
+	/**
+	 * 缺点，适合单体应用，不适合集群。
+	 * 原因：我们生成每日报表的跑批任务，只需要跑一次，如果每个节点上都部署的话，就会重复执行。
+	 * 针对该问题的一个解决方法是：借助 redis 使用分布式锁，其它拿不到锁就无法执行。
+	 * 还有一个问题是：无法主动地暂停、继续执行。
+	 */
+	@Slf4j
+	@Component
+	@EnableScheduling
+	public class SpringBootTestJob {
+	
+	    /**
+	     * 定义一个定时任务，每 2 秒执行一次
+	     */
+	    @Scheduled(fixedRate = 2000)
+	    public void reportCurrentTime() {
+	        // 在此加分布式锁
+	        log.info("当前时间: {}", System.currentTimeMillis() / 1000);
+	    }
+	
+	    /**
+	     * 使用 cron，秒、分、时、日、月、星期
+	     * 每分钟的秒数除以 2，余数为 0 则执行
+	     */
+	    @Scheduled(cron = "0/2 * * * * *")
+	    public void executeTaskWithCron() {
+	        // 在此加分布式锁
+	        log.info("执行任务: {}", System.currentTimeMillis() / 1000);
+	    }
+	}
+	```
+
+2. 缺点：适合单体应用，不适合集群。
+
+3. 原因：我们生成每日报表的跑批任务，只需要跑一次，如果每个节点上都部署的话，就会重复执行。
+
+4. 针对该问题的一个解决方法是：借助 redis 使用分布式锁，其它拿不到锁就无法执行。
+
+5. 还有一个问题是：无法主动地暂停、继续执行，以及修改跑批时间。
+
+---
+
+
+
+### Quartz
+
+1. 依赖：
+
+	```xml
+	<!--quartz的springboot依赖-->
+	<dependency>
+	    <groupId>org.springframework.boot</groupId>
+	    <artifactId>spring-boot-starter-quartz</artifactId>
+	</dependency>
+	```
+
+2. TestJob，必须实现 Job 接口：
+
+	```java
+	@Slf4j
+	@DisallowConcurrentExecution // 禁止任务并发执行
+	public class TestJob implements Job {
+	
+	    private static final Long baseTimeSecond;
+	
+	    static {
+	        baseTimeSecond = System.currentTimeMillis() / 1000;
+	    }
+	
+	    @Override
+	    public void execute(JobExecutionContext context) throws JobExecutionException {
+	        String logId = CommonUtil.generateUUID(CommonConst.LOG_ID_LENGTH);
+	        MDC.put("LOG_ID", logId);
+	        log.info("开始时间: {} 秒", System.currentTimeMillis() / 1000 - baseTimeSecond);
+	        try {
+	            Thread.sleep(3000);
+	        } catch (InterruptedException e) {
+	            throw new RuntimeException("被唤醒了");
+	        }
+	        log.info("结束时间: {} 秒", System.currentTimeMillis() / 1000 - baseTimeSecond);
+	    }
+	}
+	```
+
+3. 使用配置类写死任务的方法：在 QuartzConfig 中配置需要执行的任务，和任务何时执行的触发器：
+
+	```java
+	/**
+	 * 该配置类只有在第一次被读取时，会将其配置内容存储到数据库中，
+	 * 之后就直接读取数据库获取配置，而不再读取此配置类了。
+	 * Quartz 发现数据库中有某个 Job 的 Detail 配置和触发器 Trigger 配置，就会自动的按配置执行该任务
+	 */
+	@Configuration
+	public class QuartzConfig {
+	
+	    /**
+	     * 声明一个任务
+	     */
+	    @Bean
+	    public JobDetail jobDetail() {
+	        return JobBuilder.newJob(TestJob.class)
+	                .withIdentity("TestJob", "test")
+	                .storeDurably()
+	                .build();
+	    }
+	
+	    /**
+	     * 声明一个触发器，什么时候执行任务
+	     */
+	    @Bean
+	    public Trigger trigger() {
+	        return TriggerBuilder.newTrigger()
+	                .forJob(jobDetail())
+	                .withIdentity("TestJobTrigger", "trigger")
+	                .startNow()
+	                // 每2秒执行一次
+	                .withSchedule(CronScheduleBuilder.cronSchedule("*/2 * * * * ?"))
+	                .build();
+	    }
+	}
+	```
+
+4. 但是写死配置类的方法并不灵活，我们想让 quartz 将任务和触发器存储到数据库，然后我们对外提供 http 接口，这样前端就可以通过访问这些接口，修改数据库中的数据，实现暂停跑批、修改跑批时间频率等操作，以下为提供 http 接口的操作：
+
+5. MyJobFactory：
+
+	```java
+	@Component
+	public class MyJobFactory extends SpringBeanJobFactory {
+	
+	    @Resource
+	    private AutowireCapableBeanFactory beanFactory;
+	
+	    /**
+	     * 这里覆盖了 super 的 createJobInstance 方法，对其创建出来的类再进行 autowire。
+	     */
+	    @Override
+	    protected Object createJobInstance(TriggerFiredBundle bundle) throws Exception {
+	        Object jobInstance = super.createJobInstance(bundle);
+	        beanFactory.autowireBean(jobInstance);
+	        return jobInstance;
+	    }
+	}
+	```
+
+6. SchedulerConfig，集成官方提供的 Mysql 数据源：
+
+	```java
+	@Configuration
+	public class SchedulerConfig {
+	
+	    @Resource
+	    private MyJobFactory myJobFactory;
+	
+	    /**
+	     * 将 Quartz 的 SchedulerFactory 集成官方提供的 Mysql 数据源后的 Bean
+	     * @param dataSource Quartz 官方提供的 Mysql 数据源
+	     */
+	    @Bean
+	    public SchedulerFactoryBean schedulerFactoryBean(@Qualifier("dataSource") DataSource dataSource) throws IOException {
+	        SchedulerFactoryBean factory = new SchedulerFactoryBean();
+	        factory.setDataSource(dataSource);
+	        factory.setJobFactory(myJobFactory);
+	        factory.setStartupDelay(2); // 启动之后多少秒，开始执行 Quartz
+	        return factory;
+	    }
+	}
+	```
+
+7. 对外提供的操作 Quartz Mysql 数据源的 http 接口：
+
+	```java
+	@Slf4j
+	@RestController
+	@RequestMapping(value = "/admin/job")
+	public class JobController {
+	    // 这里必须是 Autowired，不能是 Resource，
+	    // 否则会报错: Bean named 'schedulerFactoryBean' is expected to be of type 'org.springframework.scheduling.quartz.SchedulerFactoryBean' but was actually of type 'org.quartz.impl.StdScheduler'
+	    // 猜测原因是 MyFactory 中:
+	    //    @Override
+	    //    protected Object createJobInstance(TriggerFiredBundle bundle) throws Exception {
+	    //        Object jobInstance = super.createJobInstance(bundle);
+	    //        beanFactory.autowireBean(jobInstance);
+	    //        return jobInstance;
+	    //    }
+	    // `beanFactory.autowireBean(jobInstance);` 中写到了 autowire
+	    @Autowired
+	    private SchedulerFactoryBean schedulerFactoryBean;
+	
+	    /**
+	     * 手动立马执行一次任务
+	     */
+	    @RequestMapping(value = "/run", method = RequestMethod.POST)
+	    public ResponseVo run(@Valid @RequestBody CronForm form) throws SchedulerException {
+	        String jobClassName = form.getName();
+	        String jobGroupName = form.getGroup();
+	        log.info("手动执行任务开始: {}, {}", jobClassName, jobGroupName);
+	
+	        try {
+	            schedulerFactoryBean.getScheduler().triggerJob(JobKey.jobKey(jobClassName, jobGroupName));
+	
+	        } catch (SchedulerException e) {
+	            log.error("手动执行任务失败，调度异常: ", e);
+	            return ResponseVo.error(ResponseEnum.BATCH_SCHEDULER_RUN_FAILED_DISPATCH_ERROR);
+	        }
+	        return ResponseVo.success();
+	    }
+	
+	    /**
+	     * 添加新任务，要传入全类名
+	     */
+	    @RequestMapping(value = "/add", method = RequestMethod.POST)
+	    public ResponseVo add(@Valid @RequestBody CronForm form) {
+	        String jobClassName = form.getName();
+	        String jobGroupName = form.getGroup();
+	        String cronExpression = form.getCronExpression();
+	        String description = form.getDescription();
+	        log.info("创建定时任务开始: {}，{}，{}，{}", jobClassName, jobGroupName, cronExpression, description);
+	
+	        try {
+	            // 通过SchedulerFactory 获取一个调度器实例
+	            Scheduler scheduler = schedulerFactoryBean.getScheduler();
+	
+	            // 启动调度器
+	            scheduler.start();
+	
+	            // 构建 job 信息
+	            JobDetail jobDetail = JobBuilder
+	                    .newJob((Class<? extends Job>) Class.forName(jobClassName))
+	                    .withIdentity(jobClassName, jobGroupName)
+	                    .build();
+	
+	            // 表达式调度构建器(即任务执行的时间)
+	            CronScheduleBuilder scheduleBuilder = CronScheduleBuilder.cronSchedule(cronExpression);
+	
+	            // 按新的 cronExpression 表达式构建一个新的 trigger
+	            CronTrigger trigger = TriggerBuilder
+	                    .newTrigger()
+	                    .withIdentity(jobClassName, jobGroupName)
+	                    .withDescription(description)
+	                    .withSchedule(scheduleBuilder)
+	                    .build();
+	
+	            scheduler.scheduleJob(jobDetail, trigger);
+	        } catch (SchedulerException e) {
+	            log.error("创建定时任务失败，调度异常: ", e);
+	            return ResponseVo.error(ResponseEnum.BATCH_SCHEDULER_ADD_FAILED_DISPATCH_ERROR);
+	        } catch (ClassNotFoundException e) {
+	            log.error("创建定时任务失败，任务类不存在: ", e);
+	            return ResponseVo.error(ResponseEnum.BATCH_SCHEDULER_ADD_FAILED_JOB_NOT_FOUND);
+	        }
+	
+	        return ResponseVo.success();
+	    }
+	
+	    /**
+	     * 暂停指定任务
+	     */
+	    @RequestMapping(value = "/pause", method = RequestMethod.POST)
+	    public ResponseVo pause(@Valid @RequestBody CronForm form) {
+	        String jobClassName = form.getName();
+	        String jobGroupName = form.getGroup();
+	        log.info("暂停定时任务开始: {}，{}", jobClassName, jobGroupName);
+	
+	        try {
+	            Scheduler scheduler = schedulerFactoryBean.getScheduler();
+	            scheduler.pauseJob(JobKey.jobKey(jobClassName, jobGroupName));
+	        } catch (SchedulerException e) {
+	            log.error("暂停定时任务失败，调度异常: ", e);
+	            return ResponseVo.error(ResponseEnum.BATCH_SCHEDULER_PAUSE_FAILED_DISPATCH_ERROR);
+	        }
+	
+	        return ResponseVo.success();
+	    }
+	
+	    /**
+	     * 恢复指定任务
+	     */
+	    @RequestMapping(value = "/resume", method = RequestMethod.POST)
+	    public ResponseVo resume(@Valid @RequestBody CronForm form) {
+	        String jobClassName = form.getName();
+	        String jobGroupName = form.getGroup();
+	        log.info("重启定时任务开始: {}，{}", jobClassName, jobGroupName);
+	
+	        try {
+	            Scheduler scheduler = schedulerFactoryBean.getScheduler();
+	            scheduler.resumeJob(JobKey.jobKey(jobClassName, jobGroupName));
+	        } catch (SchedulerException e) {
+	            log.error("重启定时任务失败，调度异常: ", e);
+	            return ResponseVo.error(ResponseEnum.BATCH_SCHEDULER_RESUME_FAILED_DISPATCH_ERROR);
+	        }
+	
+	        return ResponseVo.success();
+	    }
+	
+	    /**
+	     * 重定义指定任务
+	     */
+	    @RequestMapping(value = "/reschedule", method = RequestMethod.POST)
+	    public ResponseVo reschedule(@Valid @RequestBody CronForm form) {
+	        String jobClassName = form.getName();
+	        String jobGroupName = form.getGroup();
+	        String cronExpression = form.getCronExpression();
+	        String description = form.getDescription();
+	        log.info("更新定时任务开始：{}，{}，{}，{}", jobClassName, jobGroupName, cronExpression, description);
+	
+	        try {
+	            Scheduler scheduler = schedulerFactoryBean.getScheduler();
+	            TriggerKey triggerKey = TriggerKey.triggerKey(jobClassName, jobGroupName);
+	
+	            // 表达式调度构建器
+	            CronScheduleBuilder scheduleBuilder = CronScheduleBuilder.cronSchedule(cronExpression);
+	            CronTriggerImpl _trigger = (CronTriggerImpl) scheduler.getTrigger(triggerKey);
+	            _trigger.setStartTime(new Date()); // 重新设置开始时间
+	            CronTrigger trigger = _trigger;
+	
+	            // 按新的 cronExpression 表达式重新构建 trigger
+	            trigger = trigger.getTriggerBuilder()
+	                    .withIdentity(triggerKey)
+	                    .withDescription(description)
+	                    .withSchedule(scheduleBuilder)
+	                    .build();
+	
+	            // 按新的trigger重新设置job执行
+	            scheduler.rescheduleJob(triggerKey, trigger);
+	
+	        } catch (Exception e) {
+	            log.error("更新定时任务失败，调度异常: ", e);
+	            return ResponseVo.error(ResponseEnum.BATCH_SCHEDULER_RESCHEDULE_FAILED_DISPATCH_ERROR);
+	        }
+	
+	        return ResponseVo.success();
+	    }
+	
+	    /**
+	     * 删除指定任务
+	     */
+	    @RequestMapping(value = "/delete", method = RequestMethod.POST)
+	    public ResponseVo delete(@Valid @RequestBody CronForm form) {
+	        String jobClassName = form.getName();
+	        String jobGroupName = form.getGroup();
+	        log.info("删除定时任务开始: {}，{}", jobClassName, jobGroupName);
+	
+	        try {
+	            Scheduler scheduler = schedulerFactoryBean.getScheduler();
+	            scheduler.pauseTrigger(TriggerKey.triggerKey(jobClassName, jobGroupName));
+	            scheduler.unscheduleJob(TriggerKey.triggerKey(jobClassName, jobGroupName));
+	            scheduler.deleteJob(JobKey.jobKey(jobClassName, jobGroupName));
+	
+	        } catch (SchedulerException e) {
+	            log.error("删除定时任务失败，调度异常:", e);
+	            return ResponseVo.error(ResponseEnum.BATCH_SCHEDULER_DELETE_FAILED_DISPATCH_ERROR);
+	        }
+	
+	        return ResponseVo.success();
+	    }
+	
+	    /**
+	     * 查看所有任务
+	     */
+	    @RequestMapping(value = "/query", method = RequestMethod.GET)
+	    public ResponseVo query() {
+	        log.info("查看所有定时任务开始");
+	
+	        List<CronVo> cronJobList = new ArrayList<>();
+	        try {
+	            Scheduler scheduler = schedulerFactoryBean.getScheduler();
+	            for (String groupName : scheduler.getJobGroupNames()) {
+	                for (JobKey jobKey : scheduler.getJobKeys(GroupMatcher.jobGroupEquals(groupName))) {
+	                    CronVo vo = getCronVo(jobKey, scheduler);
+	                    cronJobList.add(vo);
+	                }
+	            }
+	
+	        } catch (SchedulerException e) {
+	            log.error("查看定时任务失败，调度异常:", e);
+	            return ResponseVo.error(ResponseEnum.BATCH_SCHEDULER_QUERY_FAILED_DISPATCH_ERROR);
+	        }
+	
+	        return ResponseVo.success(cronJobList);
+	    }
+	
+	    private static CronVo getCronVo(JobKey jobKey, Scheduler scheduler) throws SchedulerException {
+	        CronVo vo = new CronVo();
+	        vo.setName(jobKey.getName());
+	        vo.setGroup(jobKey.getGroup());
+	
+	        List<Trigger> triggers = (List<Trigger>) scheduler.getTriggersOfJob(jobKey);
+	        CronTrigger cronTrigger = (CronTrigger) triggers.get(0);
+	        vo.setDescription(cronTrigger.getDescription());
+	        vo.setCronExpression(cronTrigger.getCronExpression());
+	
+	        Trigger.TriggerState triggerState = scheduler.getTriggerState(cronTrigger.getKey());
+	        vo.setState(triggerState.name());
+	        vo.setNextFireTime(cronTrigger.getNextFireTime());
+	        vo.setPreFireTime(cronTrigger.getPreviousFireTime());
+	        return vo;
+	    }
+	}
+	```
+
+---
+
+
+
 ## 第三方服务
 
 ### 阿里云短信服务
@@ -1055,20 +1467,35 @@ generator-config.xml
 
 
 
-### freemarker 引擎
+### 基于 freemarker 的代码生成器
 
 1. 引入依赖：
 
-	```xml
-	<!--模板引擎 freemarker-->
-	<dependency>
-	    <groupId>org.freemarker</groupId>
-	    <artifactId>freemarker</artifactId>
-	    <version>2.3.31</version>
-	</dependency>
-	```
+  ```xml
+  <!--模板引擎 freemarker-->
+  <dependency>
+      <groupId>org.freemarker</groupId>
+      <artifactId>freemarker</artifactId>
+      <version>2.3.31</version>
+  </dependency>
+  <!--dom4j，读取 xml 文件-->
+  <dependency>
+      <groupId>org.dom4j</groupId>
+      <artifactId>dom4j</artifactId>
+  </dependency>
+  <!--jaxen，使用 XPATH，可用于在 xml 中寻找所需的标签-->
+  <dependency>
+      <groupId>jaxen</groupId>
+      <artifactId>jaxen</artifactId>
+  </dependency>
+  <!--mysql驱动，5.1开头的版本支持mysql5.7-->
+  <dependency>
+      <groupId>mysql</groupId>
+      <artifactId>mysql-connector-java</artifactId>
+  </dependency>
+  ```
 
-2. 工具类：
+2. FreemarkerUtil 工具类：
 
 	```java
 	public class FreemarkerUtil {
@@ -1101,7 +1528,7 @@ generator-config.xml
 	}
 	```
 
-3. ftl 模板：
+3. ftl_demo 模板：
 
 	```js
 	public class ${domain} {
@@ -1109,7 +1536,7 @@ generator-config.xml
 	}
 	```
 
-4. 使用：
+4. Demo 的使用：
 
 	```java
 	public class ServerGenerator {
@@ -1123,8 +1550,576 @@ generator-config.xml
 	    }
 	}
 	```
+	
+5. 读取数据库信息的工具类 DBUtil：
+
+  ```java
+  public class DBUtil {
+  
+      public static String url = "";
+  
+      public static String user = "";
+  
+      public static String password = "";
+  
+      private static final String MYSQL_JDBC_DRIVER_VERSION_5_7 = "com.mysql.jdbc.Driver";
+  
+      private static final String MYSQL_JDBC_DRIVER_VERSION_8_0 = "com.mysql.cj.jdbc.Driver";
+  
+      public static Connection getConnection() {
+          Connection conn = null;
+          try {
+              Class.forName(MYSQL_JDBC_DRIVER_VERSION_5_7);
+              String url = DBUtil.url;
+              String user = DBUtil.user;
+              String password = DBUtil.password;
+              conn = DriverManager.getConnection(url, user, password);
+          } catch (ClassNotFoundException e) {
+              System.out.println("【看你是不是忘了在 pom.xml 中引入对应版本的 Mysql 驱动】");
+              e.printStackTrace();
+          } catch (SQLException e) {
+              System.out.println("【看你是不是忘了在使用 DBUtil 之前先对 url, user, password 赋值】");
+              e.printStackTrace();
+          }
+          return conn;
+      }
+  
+      /**
+       * 获得表注释
+       */
+      public static String getTableComment(String tableName) throws Exception {
+          Connection conn = getConnection();
+          Statement stmt = conn.createStatement();
+          ResultSet rs = stmt.executeQuery("select table_comment from information_schema.tables Where table_name = '" + tableName + "'");
+          String tableNameCH = "";
+          if (rs != null) {
+              while (rs.next()) {
+                  tableNameCH = rs.getString("table_comment");
+                  break;
+              }
+          }
+          rs.close();
+          stmt.close();
+          conn.close();
+          System.out.println("表名：" + tableNameCH);
+          return tableNameCH;
+      }
+  
+      /**
+       * 获得所有列信息
+       */
+      public static List<Field> getColumnByTableName(String tableName) throws Exception {
+          List<Field> fieldList = new ArrayList<>();
+          Connection conn = getConnection();
+          Statement stmt = conn.createStatement();
+          ResultSet rs = stmt.executeQuery("show full columns from `" + tableName + "`");
+          if (rs != null) {
+              while (rs.next()) {
+                  String columnName = rs.getString("Field");
+                  String type = rs.getString("Type");
+                  String comment = rs.getString("Comment");
+                  String nullAble = rs.getString("Null"); //YES NO
+                  Field field = new Field();
+                  field.setName(columnName);
+                  field.setNameHump(lineToHump(columnName));
+                  field.setNameBigHump(lineToBigHump(columnName));
+                  field.setType(type);
+                  field.setJavaType(DBUtil.sqlTypeToJavaType(type));
+                  field.setComment(comment);
+                  if (comment.contains("|")) {
+                      field.setNameCn(comment.substring(0, comment.indexOf("|")));
+                  } else {
+                      field.setNameCn(comment);
+                  }
+                  field.setNullAble("YES".equals(nullAble));
+                  if (type.toUpperCase().contains("varchar".toUpperCase())) {
+                      String lengthStr = type.substring(type.indexOf("(") + 1, type.length() - 1);
+                      field.setLength(Integer.valueOf(lengthStr));
+                  } else {
+                      field.setLength(0);
+                  }
+                  if (comment.contains("枚举")) {
+                      field.setEnums(true);
+  
+                      // 以课程等级为例：从注释中的“枚举[CourseLevelEnum]”，得到enumsConst = COURSE_LEVEL
+                      int start = comment.indexOf("[");
+                      int end = comment.indexOf("]");
+                      String enumsName = comment.substring(start + 1, end); // CourseLevelEnum
+                      String enumsConst = StrUtil.toUnderlineCase(enumsName)
+                              .toUpperCase().replace("_ENUM", "");
+                      field.setEnumsConst(enumsConst);
+                  } else {
+                      field.setEnums(false);
+                  }
+                  fieldList.add(field);
+              }
+          }
+          rs.close();
+          stmt.close();
+          conn.close();
+          System.out.println("列信息：" + JSONUtil.toJsonPrettyStr(fieldList));
+          return fieldList;
+      }
+  
+      /**
+       * 下划线转小驼峰：member_id 转成 memberId
+       */
+      public static String lineToHump(String str) {
+          Pattern linePattern = Pattern.compile("_(\\w)");
+          str = str.toLowerCase();
+          Matcher matcher = linePattern.matcher(str);
+          StringBuffer sb = new StringBuffer();
+          while (matcher.find()) {
+              matcher.appendReplacement(sb, matcher.group(1).toUpperCase());
+          }
+          matcher.appendTail(sb);
+          return sb.toString();
+      }
+  
+      /**
+       * 下划线转大驼峰：member_id 转成 MemberId
+       */
+      public static String lineToBigHump(String str) {
+          String s = lineToHump(str);
+          return s.substring(0, 1).toUpperCase() + s.substring(1);
+      }
+  
+      /**
+       * 数据库类型转为Java类型
+       */
+      public static String sqlTypeToJavaType(String sqlType) {
+          if (sqlType.toUpperCase().contains("varchar".toUpperCase())
+                  || sqlType.toUpperCase().contains("char".toUpperCase())
+                  || sqlType.toUpperCase().contains("text".toUpperCase())) {
+              return "String";
+          } else if (sqlType.toUpperCase().contains("datetime".toUpperCase())) {
+              return "Date";
+          } else if (sqlType.toUpperCase().contains("time".toUpperCase())) {
+              return "Date";
+          } else if (sqlType.toUpperCase().contains("date".toUpperCase())) {
+              return "Date";
+          } else if (sqlType.toUpperCase().contains("bigint".toUpperCase())) {
+              return "Long";
+          } else if (sqlType.toUpperCase().contains("int".toUpperCase())) {
+              return "Integer";
+          } else if (sqlType.toUpperCase().contains("long".toUpperCase())) {
+              return "Long";
+          } else if (sqlType.toUpperCase().contains("decimal".toUpperCase())) {
+              return "BigDecimal";
+          } else if (sqlType.toUpperCase().contains("boolean".toUpperCase())) {
+              return "Boolean";
+          } else {
+              return "String";
+          }
+      }
+  
+      public static void main(String[] args) throws Exception {
+          DBUtil.url = "jdbc:mysql://localhost:3306/train_business?characterEncoding=UTF-8&amp;autoReconnect=true&amp;useSSL=false&amp;serverTimezone=Asia/Shanghai";
+          DBUtil.user = "root";
+          DBUtil.password = "1234";
+          Connection conn = getConnection();
+          Statement stmt = conn.createStatement();
+          ResultSet rs = stmt.executeQuery("show tables");
+          if (rs != null) {
+              while (rs.next()) {
+                  String tableName = rs.getString("Tables_in_train_business");
+                  String str = "<table tableName=\"%s\" domainObjectName=\"%s\"/>".formatted(tableName, DBUtil.lineToBigHump(tableName));
+                  System.out.println(str);
+              }
+          }
+          rs.close();
+          stmt.close();
+          conn.close();
+      }
+  }
+  ```
+
+6. 读取数据库时，需要读出来的属性 Field：
+
+	```java
+	@Data
+	public class Field {
+	    /**
+	     * 字段名：course_id
+	     */
+	    private String name;
+	
+	    /**
+	     * 字段名小驼峰：courseId
+	     */
+	    private String nameHump;
+	
+	    /**
+	     * 字段名大驼峰：CourseId
+	     */
+	    private String nameBigHump;
+	
+	    /**
+	     * 中文名：课程
+	     */
+	    private String nameCn;
+	
+	    /**
+	     * 字段类型：char(8)
+	     */
+	    private String type;
+	
+	    /**
+	     * java类型：String
+	     */
+	    private String javaType;
+	
+	    /**
+	     * 注释：课程|ID
+	     */
+	    private String comment;
+	
+	    /**
+	     * 是否可为空
+	     */
+	    private Boolean nullAble;
+	
+	    /**
+	     * 字符串长度
+	     */
+	    private Integer length;
+	
+	    /**
+	     * 是否是枚举
+	     */
+	    private Boolean enums;
+	
+	    /**
+	     * 枚举常量 COURSE_LEVEL，用于生成前端的 js 静态文件
+	     */
+	    private String enumsConst;
+	}
+	```
+
+7. 集成读取数据库功能后的前后端代码生成器 ServerGenerator：
+
+	> 1. 需要从 pom.xml 中读取 Mybatis-Generator_Path
+	> 2. 从 generator-config-[module_name].xml 中读取需要生成前后端代码的表名
+	> 3. 
+
+	```java
+	public class ServerGenerator {
+	
+	    private static String pomPath = "generator/pom.xml/";
+	
+	    private static String serverPath = "[module]/src/main/java/garry/train/[module]/";
+	
+	    private static String vuePath = "[isAdmin]/src/views/main/";
+	
+	    private static String module = "";
+	
+	    public static void main(String[] args) throws Exception {
+	        // 获取 mybatis-generator 配置文件的路径
+	        String generatorPath = getGeneratorPath();
+	
+	        // 获取 module，替换 serverPath 中的 [module]
+	        module = generatorPath.replace("src/main/resources/generator-config-", "").replace(".xml", "");
+	        System.out.println("module = " + module);
+	        serverPath = serverPath.replace("[module]", module);
+	
+	        Document document = new SAXReader().read("generator/" + generatorPath);
+	        // 获取数据库连接的参数
+	        Node jdbcConnection = document.selectSingleNode("//jdbcConnection");
+	        Node connectionURL = jdbcConnection.selectSingleNode("@connectionURL");
+	        System.out.println("connectionURL = " + connectionURL.getText());
+	        Node userId = jdbcConnection.selectSingleNode("@userId");
+	        System.out.println("userId = " + userId.getText());
+	        Node password = jdbcConnection.selectSingleNode("@password");
+	        System.out.println("password = " + password.getText());
+	        DBUtil.url = connectionURL.getText();
+	        DBUtil.user = userId.getText();
+	        DBUtil.password = password.getText();
+	
+	        // 遍历每一个 table
+	        List<Node> tables = document.selectNodes("//table");
+	        for (Node table : tables) {
+	            Node tableName = table.selectSingleNode("@tableName");
+	            Node domainObjectName = table.selectSingleNode("@domainObjectName");
+	            System.out.println("tableName: " + tableName.getText() + " / " + "domainObjectName: " + domainObjectName.getText());
+	
+	            // 示例：表名 garry_test
+	            // GarryTest，类名
+	            String Domain = domainObjectName.getText();
+	            // garryTest，属性变量名
+	            String domain = Domain.substring(0, 1).toLowerCase() + Domain.substring(1);
+	            // garry-test，url 名
+	            String do_main = tableName.getText().replace("_", "-");
+	            // 表中文名
+	            String tableNameCn = DBUtil.getTableComment(tableName.getText());
+	            List<Field> fieldList = DBUtil.getColumnByTableName(tableName.getText());
+	            Set<String> typeSet = getJavaTypes(fieldList);
+	
+	            // 组装参数
+	            HashMap<String, Object> param = new HashMap<>();
+	            param.put("module", module);
+	            param.put("Domain", Domain);
+	            param.put("domain", domain);
+	            param.put("do_main", do_main);
+	            param.put("DateTime", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")));
+	            param.put("tableNameCn", tableNameCn);
+	            param.put("fieldList", fieldList);
+	            param.put("typeSet", typeSet);
+	            System.out.println("组装参数: " + JSONUtil.toJsonPrettyStr(param));
+	
+	//            generateAll(Domain, do_main, param, true);
+	            generateVue(do_main, param, true, true);
+	        }
+	    }
+	
+	    /**
+	     * 执行代码生成
+	     *
+	     * @param Domain      pojo 类名，Passenger
+	     * @param param       额外携带的参数
+	     * @param packageName 包名，service/impl/，vo/，form/
+	     * @param target      freemarker 模板名，service-impl，save-vo，save-form
+	     */
+	    private static void generate(String Domain, HashMap<String, Object> param, String packageName, String target) throws IOException, TemplateException {
+	        System.out.println("\n------------- generate 开始 -------------");
+	        FreemarkerUtil.initConfig(target + ".ftl"); // service-impl.ftl
+	        String[] strings = target.split("-"); // ["service", "impl"]
+	        StringBuilder suffixClass = new StringBuilder(); // 类名的后缀，ServiceImpl
+	        for (String str : strings) {
+	            suffixClass.append(str.substring(0, 1).toUpperCase()).append(str.substring(1));
+	        }
+	        String toPath = serverPath + packageName; // [module]/src/main/java/garry/train/[module]/service/impl/
+	        System.out.println("toPath = " + toPath);
+	        new File(toPath).mkdirs(); // 生成 toPath 路径，避免生成时还没有这个路径
+	        String fullClassName = (Domain + suffixClass + ".java").replace("Pojo", ""); // PassengerServiceImpl.java
+	        System.out.println("fullClassName = " + fullClassName);
+	        String fullPath = toPath + fullClassName; // [module]/src/main/java/garry/train/[module]/service/impl/PassengerServiceImpl.java
+	        System.out.println("fullPath = " + fullPath);
+	        FreemarkerUtil.generator(fullPath, param);
+	        System.out.println("------------- generate 结束 -------------\n");
+	    }
+	
+	    private static void generateAll(String Domain, String do_main, HashMap<String, Object> param, Boolean isAdmin) throws IOException, TemplateException {
+	        generateBackend(Domain, param, isAdmin);
+	        generateVue(do_main, param, false, isAdmin);
+	    }
+	
+	    /**
+	     * 生成后端代码
+	     */
+	    private static void generateBackend(String Domain, HashMap<String, Object> param, Boolean isAdmin) throws IOException, TemplateException {
+	        generate(Domain, param, "pojo/", "pojo");
+	        generate(Domain, param, "form/", "save-form");
+	        generate(Domain, param, "form/", "query-form");
+	        generate(Domain, param, "vo/", "query-vo");
+	        generate(Domain, param, "service/", "service");
+	        generate(Domain, param, "service/impl/", "service-impl");
+	        if (!isAdmin)
+	            generate(Domain, param, "controller/", "controller");
+	        else
+	            generate(Domain, param, "controller/admin/", "admin-controller");
+	    }
+	
+	    /**
+	     * 专门生成前端 vue 页面的生成器
+	     */
+	    private static void generateVue(String do_main, HashMap<String, Object> param, Boolean readOnly, Boolean isAdmin) throws IOException, TemplateException {
+	        System.out.println("\n------------- generateVue 开始 -------------");
+	        param.put("readOnly", readOnly);
+	        String fullPath = "";
+	        if (!isAdmin) {
+	            FreemarkerUtil.initConfig("vue.ftl");
+	            vuePath = vuePath.replace("[isAdmin]", "web");
+	            new File(vuePath).mkdirs();
+	            fullPath = vuePath + do_main + ".vue";
+	        } else {
+	            FreemarkerUtil.initConfig("admin-vue.ftl");
+	            vuePath = vuePath.replace("[isAdmin]", "admin");
+	            new File(vuePath).mkdirs();
+	            fullPath = vuePath + do_main + ".vue";
+	        }
+	        System.out.println("fullPath = " + fullPath);
+	        FreemarkerUtil.generator(fullPath, param);
+	        System.out.println("------------- generateVue 结束 -------------\n");
+	    }
+	
+	    /**
+	     * 从 generator/pom.xml/ 中获取 Mybatis-generator 配置文件的路径
+	     */
+	    private static String getGeneratorPath() throws DocumentException {
+	        SAXReader saxReader = new SAXReader();
+	        HashMap<String, String> map = new HashMap<>();
+	        map.put("pom", "http://maven.apache.org/POM/4.0.0");
+	        saxReader.getDocumentFactory().setXPathNamespaceURIs(map);
+	        Document document = saxReader.read(pomPath);
+	        /*
+	          使用 XPATH 在 xml 文件中找寻所需的标签
+	          解释 "//pom:configurationFile"：
+	          // : 从根目录下寻找
+	          pom : xml 的命名空间
+	          configurationFile : 节点名
+	          若要找 configurationFile 下的某属性，就用:
+	          Node.selectSingleNode("@propertyName")
+	         */
+	        Node node = document.selectSingleNode("//pom:configurationFile");
+	        System.out.println("generatorPath = " + node.getText());
+	        return node.getText();
+	    }
+	
+	    /**
+	     * 获取所有的Java类型，使用Set去重
+	     */
+	    private static Set<String> getJavaTypes(List<Field> fieldList) {
+	        Set<String> set = new HashSet<>();
+	        for (int i = 0; i < fieldList.size(); i++) {
+	            Field field = fieldList.get(i);
+	            set.add(field.getJavaType());
+	        }
+	        return set;
+	    }
+	}
+	```
+
+8. ftl 模板复制到了当前目录下 (xxx.ftl)
 
 ----
+
+
+
+### 枚举类前端 enum.js 生成器
+
+1. EnumGenerator：
+
+	```java
+	public class EnumGenerator {
+	    private static String path = "admin/src/assets/js/enums.js";
+	
+	    public static void main(String[] args) {
+	        StringBuffer bufferObject = new StringBuffer();
+	        StringBuffer bufferArray = new StringBuffer();
+	        long begin = System.currentTimeMillis();
+	        try {
+	            toJson(PassengerTypeEnum.class, bufferObject, bufferArray);
+	            toJson(TrainTypeEnum.class, bufferObject, bufferArray);
+	            toJson(SeatTypeEnum.class, bufferObject, bufferArray);
+	            toJson(SeatColEnum.class, bufferObject, bufferArray);
+	
+	            StringBuffer buffer = bufferObject.append("\r\n").append(bufferArray);
+	            writeJs(buffer);
+	        } catch (Exception e) {
+	            e.printStackTrace();
+	        }
+	        long end = System.currentTimeMillis();
+	        System.out.println("执行耗时:" + (end - begin) + " 毫秒");
+	    }
+	
+	    private static void toJson(Class clazz, StringBuffer bufferObject, StringBuffer bufferArray) throws Exception {
+	        String enumConst = StrUtil.toUnderlineCase(clazz.getSimpleName())
+	                .toUpperCase().replace("_ENUM", "");
+	        Object[] objects = clazz.getEnumConstants(); // enumConst：将 YesNoEnum 变成 YES_NO
+	        Method name = clazz.getMethod("name");
+	
+	        // 排除枚举属性和$VALUES，只获取code desc等
+	        List<Field> targetFields = new ArrayList<>();
+	        Field[] fields = clazz.getDeclaredFields();
+	        for (Field field : fields) {
+	            if (!Modifier.isPrivate(field.getModifiers()) || "$VALUES".equals(field.getName())) {
+	                continue;
+	            }
+	            targetFields.add(field);
+	        }
+	
+	        // 生成对象
+	        bufferObject.append(enumConst).append("={");
+	        for (int i = 0; i < objects.length; i++) {
+	            Object obj = objects[i];
+	            bufferObject.append(name.invoke(obj)).append(":");
+	
+	            // 将一个枚举值转成JSON对象字符串
+	            formatJsonObj(bufferObject, targetFields, clazz, obj);
+	
+	            if (i < objects.length - 1) {
+	                bufferObject.append(",");
+	            }
+	        }
+	        bufferObject.append("};\r\n");
+	
+	        // 生成数组
+	        bufferArray.append(enumConst).append("_ARRAY=[");
+	        for (int i = 0; i < objects.length; i++) {
+	            Object obj = objects[i];
+	
+	            // 将一个枚举值转成JSON对象字符串
+	            formatJsonObj(bufferArray, targetFields, clazz, obj);
+	
+	            if (i < objects.length - 1) {
+	                bufferArray.append(",");
+	            }
+	        }
+	        bufferArray.append("];\r\n");
+	    }
+	
+	    /**
+	     * 将一个枚举值转成JSON对象字符串
+	     * 比如：SeatColEnum.YDZ_A("A", "A", "1")
+	     * 转成：{code:"A",desc:"A",type:"1"}
+	     */
+	    private static void formatJsonObj(StringBuffer bufferObject, List<Field> targetFields, Class clazz, Object obj) throws IllegalAccessException, InvocationTargetException, NoSuchMethodException {
+	        bufferObject.append("{");
+	        for (int j = 0; j < targetFields.size(); j++) {
+	            Field field = targetFields.get(j);
+	            String fieldName = field.getName();
+	            // 获取 targetFields 字段对应的 get 方法
+	            String getMethod = "get" + fieldName.substring(0, 1).toUpperCase() + fieldName.substring(1);
+	            bufferObject.append(fieldName).append(":\"").append(clazz.getMethod(getMethod).invoke(obj)).append("\"");
+	            if (j < targetFields.size() - 1) {
+	                bufferObject.append(",");
+	            }
+	        }
+	        bufferObject.append("}");
+	    }
+	
+	    /**
+	     * 写文件
+	     * @param stringBuffer
+	     */
+	    public static void writeJs(StringBuffer stringBuffer) {
+	        FileOutputStream out = null;
+	        try {
+	            out = new FileOutputStream(path);
+	            OutputStreamWriter osw = new OutputStreamWriter(out, "UTF-8");
+	            System.out.println(path);
+	            osw.write(stringBuffer.toString());
+	            osw.close();
+	        } catch (Exception e) {
+	            e.printStackTrace();
+	        }
+	        finally {
+	            try {
+	                out.close();
+	            } catch (Exception e) {
+	                e.printStackTrace();
+	            }
+	        }
+	    }
+	}
+	```
+
+2. 效果 enum.js：
+
+	```js
+	PASSENGER_TYPE={ADULT:{code:"1",desc:"成人"},CHILD:{code:"2",desc:"儿童"},STUDENT:{code:"3",desc:"学生"}};
+	TRAIN_TYPE={G:{code:"G",desc:"高铁",priceRate:"1.2"},D:{code:"D",desc:"动车",priceRate:"1"},K:{code:"K",desc:"快速",priceRate:"0.8"}};
+	SEAT_TYPE={YDZ:{code:"1",desc:"一等座",price:"0.4"},EDZ:{code:"2",desc:"二等座",price:"0.3"},RW:{code:"3",desc:"软卧",price:"0.6"},YW:{code:"4",desc:"硬卧",price:"0.5"}};
+	SEAT_COL={YDZ_A:{code:"A",desc:"A",type:"1"},YDZ_C:{code:"C",desc:"C",type:"1"},YDZ_D:{code:"D",desc:"D",type:"1"},YDZ_F:{code:"F",desc:"F",type:"1"},EDZ_A:{code:"A",desc:"A",type:"2"},EDZ_B:{code:"B",desc:"B",type:"2"},EDZ_C:{code:"C",desc:"C",type:"2"},EDZ_D:{code:"D",desc:"D",type:"2"},EDZ_F:{code:"F",desc:"F",type:"2"}};
+	
+	PASSENGER_TYPE_ARRAY=[{code:"1",desc:"成人"},{code:"2",desc:"儿童"},{code:"3",desc:"学生"}];
+	TRAIN_TYPE_ARRAY=[{code:"G",desc:"高铁",priceRate:"1.2"},{code:"D",desc:"动车",priceRate:"1"},{code:"K",desc:"快速",priceRate:"0.8"}];
+	SEAT_TYPE_ARRAY=[{code:"1",desc:"一等座",price:"0.4"},{code:"2",desc:"二等座",price:"0.3"},{code:"3",desc:"软卧",price:"0.6"},{code:"4",desc:"硬卧",price:"0.5"}];
+	SEAT_COL_ARRAY=[{code:"A",desc:"A",type:"1"},{code:"C",desc:"C",type:"1"},{code:"D",desc:"D",type:"1"},{code:"F",desc:"F",type:"1"},{code:"A",desc:"A",type:"2"},{code:"B",desc:"B",type:"2"},{code:"C",desc:"C",type:"2"},{code:"D",desc:"D",type:"2"},{code:"F",desc:"F",type:"2"}];
+	
+	```
+
+---
 
 
 
